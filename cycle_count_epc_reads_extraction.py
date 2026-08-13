@@ -30,6 +30,22 @@ ENVIRONMENT = {
 }
 
 execution_time = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H-%M-%S")
+
+def parse_utc_timestamp(value):
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+        if dt.tzinfo is None:
+            raise ValueError("Timestamp must contain a timezone")
+
+        return dt.astimezone(timezone.utc)
+
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(
+            f"Invalid UTC timestamp: {value}. "
+            f"Expected format: 2026-07-08T00:00:00Z"
+        ) from e
+
 def get_all_active_sites_sql(project_id: str) -> str:
     GET_ALL_ACTIVE_SITES = f"""
         SELECT *
@@ -41,14 +57,15 @@ def get_all_active_sites_sql(project_id: str) -> str:
     """
     return GET_ALL_ACTIVE_SITES
 
-def get_last_n_ccs_for_each_site_sql(project_id: str) -> str:
-    GET_LAST_N_CCS_FOR_EACH_SITE =  f"""
+def get_last_n_ccs_for_each_site_sql() -> str:
+    GET_LAST_N_CCS_FOR_EACH_SITE =  """
     SELECT *
     FROM `{project_id}.tvc_cycle_count.cycle_count_status`
     WHERE
       business_unit_id = @business_unit_id
       AND status = @status
       AND site_id in unnest(@site_ids)
+      {STATUS_DATE_WHERE_CLAUSE}
     QUALIFY row_number() OVER (PARTITION BY site_id ORDER BY status_date DESC) <= 3
     ORDER BY site_id, status_date DESC
     """
@@ -88,13 +105,14 @@ def get_epc_read_data_1_sql(project_id:str) -> str:
             WHERE
               business_unit_id = @business_unit_id 
               AND site_id = @site_id 
-              AND cc_id IN UNNEST(@cc_ids)
-              AND cc_submitted_date IN UNNEST(@cc_submitted_dates)
+              AND cc_id = @cc_id
+              AND cc_submitted_date = @cc_submitted_date
               AND sku is not null 
               AND zone_id is not null
         )
         SELECT
           ccs.cc_id,
+          st.site_name, 
           st.site_code,
           zn.zone_name,
           es.sku,
@@ -102,6 +120,7 @@ def get_epc_read_data_1_sql(project_id:str) -> str:
           es.read_date,
           es.cc_submitted_date,
           total_count,
+          ccs.start_date,
           ccs.cc_approved_date
         FROM epc_submit_data es
         INNER JOIN `{project_id}.tvc_facility.site` st
@@ -186,12 +205,14 @@ def main():
 
     parser.add_argument(
         "-lb", "--lower-bound-timestamp",
+        type=parse_utc_timestamp,
         required=True,
         help="Lower bound timestamp in ISO-8601 format, e.g. 2026-07-08T00:00:00Z"
     )
 
     parser.add_argument(
         "-ub" ,"--upper-bound-timestamp",
+        type=parse_utc_timestamp,
         required=False,
         help="Upper bound timestamp in ISO-8601 format, e.g. 2026-07-08T00:00:00Z"
     )
@@ -200,11 +221,13 @@ def main():
 
     config = ENVIRONMENT[args.env]
     project_id = config["project_id"]
-
+    if args.site_ids:
+        site_ids = [str(site_id) for site_id in args.site_ids]
     print(f"Environment : {args.env}")
     print(f"Business Unit ID : {args.buid}")
     print(f"Project ID : {project_id}")
-    print(f"Site IDS: {args.site_ids}")
+    if args.site_ids:
+        print(f"Site IDS: {site_ids}")
     print(f"lower bound timestamp: {args.lower_bound_timestamp}")
     print(f"upper bound timestamp: {args.upper_bound_timestamp}")
 
@@ -227,26 +250,44 @@ def main():
             )
         ]
     )
-    print("get_all_active_sites_sql")
-    print(get_all_active_sites_sql(project_id));
 
-    print("get_last_n_ccs_for_each_site_sql")
-    print(get_last_n_ccs_for_each_site_sql(project_id));
-
-    print("get_latest_submit_for_each_cc_sql")
-    print(get_latest_submit_for_each_cc_sql(project_id));
-
-    print("get_epc_read_data_sql")
-    print(get_epc_read_data_sql(project_id))
-
+    print(f"Get all active sites")
+    print(get_all_active_sites_sql(project_id))
     sites_df = read_bq_to_polars(get_all_active_sites_sql(project_id),job_config_active_sites)
     print(sites_df)
 
-    site_ids = sites_df.select(pl.col("site_id")).to_series().to_list()
+    if args.site_ids:
+        site_ids = sites_df.filter(pl.col("site_id").is_in(site_ids)).select(pl.col("site_id")).to_series().to_list()
+    else:
+        site_ids = sites_df.select(pl.col("site_id")).to_series().to_list()
 
     if not site_ids:
         print("No active sites found or check the environment")
         sys.exit(0)
+
+    query_parameters_last_n_cc = []
+    if args.lower_bound_timestamp:
+        STATUS_DATE_WHERE_CLAUSE_SQL = " AND status_date >= @lower_bound_timestamp"
+        query_parameters_last_n_cc.append(
+            bigquery.ScalarQueryParameter(
+                "lower_bound_timestamp",
+                "TIMESTAMP",
+                args.lower_bound_timestamp
+            )
+        )
+
+        if args.upper_bound_timestamp:
+            STATUS_DATE_WHERE_CLAUSE_SQL = " AND status_date >= @lower_bound_timestamp and status_date <= @upper_bound_timestamp "
+            query_parameters_last_n_cc.append(
+                bigquery.ScalarQueryParameter(
+                    "upper_bound_timestamp",
+                    "TIMESTAMP",
+                    args.upper_bound_timestamp
+                )
+            )
+
+    else:
+        STATUS_DATE_WHERE_CLAUSE_SQL = ""
 
     job_config_last_n_cc = bigquery.QueryJobConfig(
         query_parameters=[
@@ -264,11 +305,18 @@ def main():
                 "site_ids",
                 "STRING",
                 site_ids
-            )
+            ),
+            *query_parameters_last_n_cc
         ]
     )
 
-    last_n_cc_for_all_sites = read_bq_to_polars(get_last_n_ccs_for_each_site_sql(project_id), job_config_last_n_cc)
+
+    last_n_ccs_for_each_site_sql = get_last_n_ccs_for_each_site_sql()
+    last_n_ccs_for_each_site_sql = last_n_ccs_for_each_site_sql.format(project_id=project_id, STATUS_DATE_WHERE_CLAUSE=STATUS_DATE_WHERE_CLAUSE_SQL)
+    print("last_n_ccs_for_each_site_sql ")
+    print(f"{last_n_ccs_for_each_site_sql }")
+
+    last_n_cc_for_all_sites = read_bq_to_polars(last_n_ccs_for_each_site_sql, job_config_last_n_cc)
     print(last_n_cc_for_all_sites)
 
     cc_ids = last_n_cc_for_all_sites.select(pl.col("cc_id")).to_series().to_list()
@@ -297,6 +345,8 @@ def main():
         ]
     )
 
+    print("get_latest_submit_for_each_cc_sql")
+    print(get_latest_submit_for_each_cc_sql(project_id))
     latest_submits_for_each_ccs = read_bq_to_polars(get_latest_submit_for_each_cc_sql(project_id), job_config_latest_submit_each_cc, False)
     print(latest_submits_for_each_ccs)
 
@@ -315,56 +365,76 @@ def main():
         output_site_dir.mkdir(parents=True, exist_ok=True)
 
         latest_submiited_cc_per_site = latest_submits_for_each_ccs.filter(pl.col("site_id") == site_id)
-        latest_submitted_cc_ids_per_site = latest_submiited_cc_per_site.select(pl.col("cc_id")).to_series().to_list()
-        latest_submitted_cc_submitted_dates_per_site = latest_submiited_cc_per_site.select(pl.col("status_date")).to_series().to_list()
 
-        print(latest_submitted_cc_ids_per_site)
-        print(latest_submitted_cc_submitted_dates_per_site)
+        for cc_row in latest_submiited_cc_per_site.iter_rows(named=True):
+           cc_id = cc_row["cc_id"]
+           cc_submitted_date = cc_row['status_date']
+           job_config_epc_submit = bigquery.QueryJobConfig(
+                query_parameters=[
+                    bigquery.ScalarQueryParameter(
+                        "business_unit_id",
+                        "STRING",
+                        args.buid
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "site_id",
+                        "STRING",
+                        site_id
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "cc_id",
+                        "STRING",
+                       cc_id
+                    ),
+                    bigquery.ScalarQueryParameter(
+                        "cc_submitted_date",
+                        "TIMESTAMP",
+                       cc_submitted_date
+                    )
+                ]
+            )
 
-        job_config_epc_submit = bigquery.QueryJobConfig(
-            query_parameters=[
-                bigquery.ScalarQueryParameter(
-                    "business_unit_id",
-                    "STRING",
-                    args.buid
-                ),
-                bigquery.ScalarQueryParameter(
-                    "site_id",
-                    "STRING",
-                    site_id
-                ),
-                bigquery.ArrayQueryParameter(
-                    "cc_ids",
-                    "STRING",
-                    latest_submitted_cc_ids_per_site
-                ),
-                bigquery.ArrayQueryParameter(
-                    "cc_submitted_dates",
-                    "TIMESTAMP",
-                    latest_submitted_cc_submitted_dates_per_site
-                )
-            ]
-        )
+           print(get_epc_read_data_1_sql(project_id))
+           epc_submit_cc_df = read_bq_to_polars(get_epc_read_data_1_sql(project_id), job_config_epc_submit)
+           from pprint import pprint
+           pprint(job_config_epc_submit.to_api_repr())
+           print(epc_submit_cc_df.shape)
+           # [
+           #     "site_code",
+           #     "site_name",
+           #     "zone_name",
+           #     "cc_id",
+           #     "cc_started_date",
+           #     "cc_submitted_date",
+           #     "cc_approved_date",
+           #     "sku",
+           #     "epc_hex",
+           #     "read_date",
+           # ]
 
-        print(get_epc_read_data_1_sql(project_id))
-        epc_submit_df = read_bq_to_polars(get_epc_read_data_1_sql(project_id), job_config_epc_submit)
-        epc_submit_cc_df = epc_submit_df.group_by(pl.col("cc_id")).agg(pl.len())
-        print(epc_submit_cc_df)
+           if not epc_submit_cc_df.is_empty():
+               cc_approved_date = epc_submit_cc_df.select(pl.col("cc_approved_date").unique()).item().date().strftime("%Y-%m-%d")
+               (
+                   epc_submit_cc_df.select(
+                       pl.col("site_code"),
+                       pl.col("site_name"),
+                       pl.col("zone_name"),
+                       pl.col("cc_id"),
+                       pl.col("start_date").alias("cc_started_date"),
+                       pl.col("cc_submitted_date"),
+                       pl.col("cc_approved_date"),
+                       pl.col("sku"),
+                       pl.col("epc_hex"),
+                       pl.col("read_date")
+                    )
+                 )
+               epc_submit_cc_df.write_csv(output_site_dir / f"{cc_approved_date}_{cc_id}.csv")
+               print( epc_submit_cc_df.shape)
 
-
-        for cc_id in latest_submitted_cc_ids_per_site:
-            if not epc_submit_cc_df.is_empty():
-                temp = epc_submit_df.filter(pl.col("cc_id") == cc_id)
-                if temp.is_empty():
-                    print("No epc data")
-                    print("Might be an empty cc or check the query for the environment")
-                    continue
-
-                cc_approved_date = temp.select(pl.col("cc_approved_date").unique()).item().date().strftime("%Y-%m-%d")
-                temp.write_csv(output_site_dir / f"{cc_approved_date}_{cc_id}.csv")
-                print(temp.shape)
-            else:
-                print("No epc data site")
+           else:
+               print("No epc submit data")
+               print("Might be an empty cc or check the query for the environment")
+               continue
 
 if __name__ == '__main__':
     main()

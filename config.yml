@@ -1,0 +1,8 @@
+---
+prod:
+  PROJECT_ID: "tvc-prod-core"
+  INSTANCE_NAME: "prod-spanner"
+
+stg:
+  PROJECT_ID: "tvc-stg"
+  INSTANCE_NAME: "stg-spanner"
