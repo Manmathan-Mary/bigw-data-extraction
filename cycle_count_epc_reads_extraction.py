@@ -399,23 +399,10 @@ def main():
            from pprint import pprint
            pprint(job_config_epc_submit.to_api_repr())
            print(epc_submit_cc_df.shape)
-           # [
-           #     "site_code",
-           #     "site_name",
-           #     "zone_name",
-           #     "cc_id",
-           #     "cc_started_date",
-           #     "cc_submitted_date",
-           #     "cc_approved_date",
-           #     "sku",
-           #     "epc_hex",
-           #     "read_date",
-           # ]
 
            if not epc_submit_cc_df.is_empty():
                cc_approved_date = epc_submit_cc_df.select(pl.col("cc_approved_date").unique()).item().date().strftime("%Y-%m-%d")
-               (
-                   epc_submit_cc_df.select(
+               epc_submit_cc_df_export = epc_submit_cc_df.select(
                        pl.col("site_code"),
                        pl.col("site_name"),
                        pl.col("zone_name"),
@@ -427,8 +414,7 @@ def main():
                        pl.col("epc_hex"),
                        pl.col("read_date")
                     )
-                 )
-               epc_submit_cc_df.write_csv(output_site_dir / f"{cc_approved_date}_{cc_id}.csv")
+               epc_submit_cc_df_export.write_csv(output_site_dir / f"{cc_approved_date}_{cc_id}.csv")
                print( epc_submit_cc_df.shape)
 
            else:
