@@ -66,7 +66,7 @@ def get_last_n_ccs_for_each_site_sql() -> str:
       AND status = @status
       AND site_id in unnest(@site_ids)
       {STATUS_DATE_WHERE_CLAUSE}
-    QUALIFY row_number() OVER (PARTITION BY site_id ORDER BY status_date DESC) <= 3
+    QUALIFY row_number() OVER (PARTITION BY site_id ORDER BY status_date DESC) <= 150
     ORDER BY site_id, status_date DESC
     """
 
